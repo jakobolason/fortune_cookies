@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment # https://kubernetes.io/docs/concepts/workloads/controllers/deployment/
+metadata:
+  name: fortune-deployment
+  namespace: default
+  labels:
+    app: fortune-cookies
+spec:
+  selector:
+    matchLabels:
+      app: fortune-cookies
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: fortune-cookies
+    spec:
+      containers:
+      - name: fortune-cookies
+        image: fortune_cookies
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 3000 
