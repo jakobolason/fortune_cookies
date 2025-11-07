@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bully-app
+spec:
+  selector:
+    matchLabels:
+      app: bully-app
+  replicas: 6
+  template:
+    metadata:
+      name: bully-app
+      labels:
+        name: bully-app
+        app: bully-app
+    spec:
+      containers:
+        - name: bully-container
+          image: fortune_cookies:v0.0.2
+          imagePullPolicy: Never
+          env:
+            - name: WEB_PORT
+              value: "3000"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - containerPort: 3000
+              name: http
+              protocol: TCP
