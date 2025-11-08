@@ -1,4 +1,4 @@
-use axum::{body::Body, extract::{FromRef, State}, http::Request, middleware::{self, Next}, response::{IntoResponse, Response}, routing::get, Json, Router
+use axum::{body::Body, extract::{FromRef, State}, http::Request, middleware::{self, Next}, response::{IntoResponse, Redirect, Response}, routing::{get, post}, Json, Router
 };
 use reqwest::StatusCode;
 use core::fmt;
@@ -57,11 +57,17 @@ impl FromRef<AppState> for LeptosOptions {
 async fn middleware_check_is_leader(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
 
     println!("request to: {}", request.uri());
-    println!("is leader? {:?}", state.leader);
-    let response = next.run(request).await;
-
-    println!("response status: {}", response.status());
-    response
+    let leader = get_leader(&state).await;
+    println!("is leader? {}, {}, {}", leader.1, state.node_id, leader.1 == state.node_id);
+    if !(leader.1 == state.node_id) {
+        eprintln!("user tried to get to this node, who was not leader!");
+        let redirect_url = format!("http://{}{}", leader.0, request.uri());
+        Redirect::temporary(&redirect_url).into_response()
+    } else {
+        let response = next.run(request).await;
+        println!("response status: {}", response.status());
+        response
+    }
 }
 
 async fn get_ids_from_peers(peers: impl Iterator<Item = SocketAddr>, port: u16) -> Vec<(Ipv4Addr, u32)> {
@@ -87,7 +93,7 @@ async fn get_ids_from_peers(peers: impl Iterator<Item = SocketAddr>, port: u16) 
 }
 
 async fn dns_lookup(service_name: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
-    println!("Making a DNS lookup to service");
+    println!("Making a DNS lookup to service with {} and port: {}", service_name, port);
     
     let address = format!("{}:{}", service_name, port);
     let addresses = lookup_host(&address).await?;
@@ -128,6 +134,14 @@ async fn write_new_leader(state: &AppState, leader: (Ipv4Addr, u32)) {
         *leader_guard = leader;
     }
 }
+
+async fn get_leader(state: &AppState) -> (Ipv4Addr, u32){
+    {
+        let leader_guard = state.leader.read().await;
+        (leader_guard.0, leader_guard.1)
+    }
+}
+
 #[derive(serde::Serialize, Debug)]
 enum MessageEndpoints {
     Coordinator,
@@ -210,11 +224,13 @@ async fn leader_election(state: AppState) {
         true
     };
     if is_leader {
+        println!("This node: {} is leader", state.node_id);
         // if no candidates or no candidates responded, we are leader 
         write_new_leader(&state, (state.node_ip.clone(), state.node_id.clone())).await;
         // send broadcast, saying it is now leader
         send_coordinator(&state, ip_list).await;
-
+        let (leader_ip, leader_id) = get_leader(&state).await;
+        println!("leader is index : {} with ip: {}", leader_id, leader_ip);
     }
     // finally release the lock
     {
@@ -238,6 +254,7 @@ async fn recieve_coordinator(
     write_new_leader(&state, (payload.ip, payload.node_id)).await;
     (StatusCode::OK, "Recieved")
 }
+
 async fn recieve_election(State(state): State<AppState>) -> &'static str {
     {
         let mut election_guard = state.in_election.write().await;
@@ -292,7 +309,7 @@ async fn main() {
         .route("/status",get(get_status))
         .route("/node_id", get(get_node_id))
         .route("/recieve_election", get(recieve_election))
-        .route("/recieve_coordination", get(recieve_coordinator))
+        .route("/recieve_coordinatior", post(recieve_coordinator))
         // .layer(tracing_layer)
         .layer(middleware::from_fn_with_state(state.clone(), middleware_check_is_leader))
         .fallback(leptos_axum::file_and_error_handler::<AppState, _>(shell))
@@ -345,7 +362,7 @@ mod tests {
         // Create a test AppState
         let state = AppState::new(
             leptos_options.clone(), 
-            u32::from(Ipv4Addr::new(127, 0, 0, 1)), 
+            Ipv4Addr::new(127, 0, 0, 1), 
             port, 
             node_id
         );
