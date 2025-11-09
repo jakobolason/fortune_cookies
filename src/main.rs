@@ -10,48 +10,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH}
 };
 use leptos::{config::LeptosOptions, html::{address, U}};
-// use uuid::Uuid;
-// use tower_http::trace::{TraceLayer, ServerErrorsFailureClass};
-// use tracing::{info, error, info_span, Span};
-// use std::time::Duration;
-use tokio::{sync::RwLock, time::{sleep, Duration, interval}, net::lookup_host};
+use tokio::{sync::{RwLock, RwLockWriteGuard}, time::{sleep, Duration, interval}, net::lookup_host};
 
-fn generate_node_id() -> u32 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    (now % 101) as u32
-}
-
-#[derive(Clone)]
-struct AppState {
-    leptos_options: LeptosOptions,
-    leader: Arc<RwLock<(Ipv4Addr, u32)>>,
-    ip_list: Arc<RwLock<Vec<(Ipv4Addr, u32)>>>,
-    node_ip: Ipv4Addr,
-    node_id: u32,
-    port: u16,
-    in_election: Arc<RwLock<bool>>,
-}
-impl AppState {
-    fn new(leptos_options: LeptosOptions, node_ip: Ipv4Addr, port: u16, node_id: u32) -> Self {
-        Self {
-            leptos_options,
-            leader: Arc::new(RwLock::new((Ipv4Addr::new(0, 0, 0, 0),0))),
-            ip_list: Arc::new(RwLock::new(Vec::new())),
-            node_ip,
-            node_id,
-            port,
-            in_election: Arc::new(RwLock::new(false)),
-        }
-    }
-}
-impl FromRef<AppState> for LeptosOptions {
-    fn from_ref(state: &AppState) -> Self {
-        state.leptos_options.clone()
-    }
-}
+use fortune_cookies::state::{AppState, generate_node_id};
 
 
 async fn middleware_check_is_leader(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
@@ -68,6 +29,13 @@ async fn middleware_check_is_leader(State(state): State<AppState>, request: Requ
         println!("response status: {}", response.status());
         response
     }
+}
+
+async fn middleware_for_api(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    println!("request to: {}", request.uri());
+    let response = next.run(request).await;
+    println!("response status: {}", response.status());
+    response
 }
 
 async fn get_ids_from_peers(peers: impl Iterator<Item = SocketAddr>, port: u16) -> Vec<(Ipv4Addr, u32)> {
@@ -96,7 +64,7 @@ async fn dns_lookup(service_name: &str, port: u16) -> Result<Vec<SocketAddr>, st
     println!("Making a DNS lookup to service with {} and port: {}", service_name, port);
     
     let address = format!("{}:{}", service_name, port);
-    let addresses = lookup_host(&address).await?;
+    let addresses  = lookup_host(&address).await?;
     
     println!("Got response from DNS");
     Ok(addresses.collect())
@@ -112,20 +80,67 @@ async fn discovery(service_name: &str, port: u16) -> Result<Vec<(Ipv4Addr, u32)>
 async fn background_task(state: AppState) {
     // let other nodes settle
     let mut interval = interval(Duration::from_secs(10));
-    
+    interval.tick().await;
+
+    // this should get all ips
+    println!("background task for node {} running at: {:?}",state.node_id, std::time::SystemTime::now());
+    match discovery("bully-service", state.port).await {
+        Ok(ips) => {
+            println!("Found ips: {:?}", ips);
+            let found_leader = {
+                let mut ip_list_guard: RwLockWriteGuard<'_, Vec<(Ipv4Addr, u32)>> = state.ip_list.write().await;
+                *ip_list_guard = ips.clone();
+                // see if any one of these have higher id
+                ips.iter().any(|entry| entry.1 > state.node_id )
+            };
+            if !found_leader {
+                println!("found no node higher than me, so starting election!");
+                // call election on yourself
+                tokio::spawn(leader_election(state.clone()));
+            }
+        }
+        Err(e) => {
+            eprintln!("DNS lookup failed: {}", e);
+        }
+    }
     loop {
         interval.tick().await;
         println!("background task for node {} running at: {:?}",state.node_id, std::time::SystemTime::now());
         match discovery("bully-service", state.port).await {
             Ok(ips) => {
                 println!("Found ips: {:?}", ips);
+                let previous_leader = {
+                    let (_, leader_id) = get_leader(&state).await;
+                    // write ips to list
+                    let mut ip_list_guard: RwLockWriteGuard<'_, Vec<(Ipv4Addr, u32)>> = state.ip_list.write().await;
+                    *ip_list_guard = ips.clone();
+                    leader_id
+                }; // drop ip_list lock
+
+                let mut found_leader = 0;
+                // this should converge to leader_id, but starts with own id
+                for ip in &ips {
+                    // check for leader
+                    if ip.1 > found_leader {
+                        found_leader = ip.1;
+                    }
+                }
+                // these could be collected, but just to have more clear logs
+                if previous_leader != found_leader {
+                    // if the leader is dead, then a lower node is the one we found
+                    println!("The current leader is missing, or a higher node exists now!");
+                    tokio::spawn(leader_election(state.clone()));
+                } 
+                else if found_leader < state.node_id {
+                    println!("the found leader is smaller than me, calling election!");
+                    tokio::spawn(leader_election(state.clone()));
+                }
             }
             Err(e) => {
                 eprintln!("DNS lookup failed: {}", e);
             }
         }
     }
-
 }
 
 async fn write_new_leader(state: &AppState, leader: (Ipv4Addr, u32)) {
@@ -194,11 +209,18 @@ async fn send_election(endpoints: Vec<Ipv4Addr>, port: u16)
     resp
 }
 
-
 // election algorithmn
 async fn leader_election(state: AppState) {
+    {
+        let mut election_guard = state.in_election.write().await;
+        if *election_guard {
+            println!("Node {} is already in an election, ignoring new call.", state.node_id);
+            return; // Already in an election, do nothing
+        }
+        *election_guard = true;
+    }
     println!("Starting election for node {}", state.node_id);
-    let ip_list_guard = state.ip_list.read().await;
+    let ip_list_guard: Vec<(Ipv4Addr, u32)> = state.ip_list.read().await.to_vec();
     let ip_list = ip_list_guard.clone();
     let election_candidates: Vec<Ipv4Addr> = ip_list
         .iter()
@@ -256,13 +278,7 @@ async fn recieve_coordinator(
 }
 
 async fn recieve_election(State(state): State<AppState>) -> &'static str {
-    {
-        let mut election_guard = state.in_election.write().await;
-        if !*election_guard {
-            *election_guard = true;
-            tokio::spawn(leader_election(state.clone()));
-        }
-    }
+    tokio::spawn(leader_election(state.clone()));
     "OK"
 }
 
@@ -301,19 +317,30 @@ async fn main() {
     };
     let state = AppState::new(leptos_options, ip_addr, port, generate_node_id());
 
-    let app = Router::new()
-        .leptos_routes(&state, routes, {
-            let leptos_options = state.leptos_options.clone();
-            move || shell(leptos_options.clone())
-        })
+    let api_router = Router::new()
         .route("/status",get(get_status))
         .route("/node_id", get(get_node_id))
         .route("/recieve_election", get(recieve_election))
-        .route("/recieve_coordinatior", post(recieve_coordinator))
-        // .layer(tracing_layer)
+        .route("/recieve_coordinator", post(recieve_coordinator))
+        .with_state(state.clone());
+
+    let leptos_router = Router::new()
+        .leptos_routes(&state, routes, {
+            let leptos_options = state.leptos_options.clone();
+            let app_state_for_context = state.clone();
+            move || {
+                use leptos::prelude::provide_context;
+
+                provide_context(app_state_for_context.clone());
+                shell(leptos_options.clone())}
+        })
         .layer(middleware::from_fn_with_state(state.clone(), middleware_check_is_leader))
         .fallback(leptos_axum::file_and_error_handler::<AppState, _>(shell))
         .with_state(state.clone());
+
+    let app = Router::new()
+        .merge(api_router)
+        .merge(leptos_router);
 
     let background_handle = tokio::spawn(background_task(state.clone()));
     // run our app with hyper

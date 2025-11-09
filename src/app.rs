@@ -5,6 +5,37 @@ use leptos_router::{
     StaticSegment,
 };
 use std::cell::Cell;
+use serde::{Serialize, Deserialize};
+use std::net::Ipv4Addr;
+
+// The frontend representation of appState, since that one is behind server feature
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub this_node_id: u32,
+    pub this_node_ip: Ipv4Addr,
+    pub current_leader: (Ipv4Addr, u32),
+    pub all_nodes: Vec<(Ipv4Addr, u32)>,
+}
+
+#[server]
+pub async fn get_node_status() -> Result<NodeStatus, ServerFnError> {
+    use crate::state::AppState;
+    let state: AppState = use_context::<AppState>()
+        .ok_or_else(|| ServerFnError::new("app state not found"))?;
+
+    let leader_guard = state.leader.read().await;
+    let ip_list_guard = state.ip_list.read().await;
+
+    let status = NodeStatus {
+        this_node_id: state.node_id,
+        this_node_ip: state.node_ip,
+        current_leader: leader_guard.clone(),
+        all_nodes: ip_list_guard.clone(),
+    };
+    
+    Ok(status)
+
+}
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -65,8 +96,8 @@ fn HomePage() -> impl IntoView {
         "Hidden in a valley beside an open stream- This will be the type of place where you will find your dream.",
         "A chance meeting opens new doors to success and friendship.",
         "You learn from your mistakes... You will learn a lot today.",
-        "If you have something good in your life, don’t let it go!",
-        "What ever you’re goal is in life, embrace it visualize it, and for it will be yours.",
+        "If you have something good in your life, don't let it go!",
+        "What ever you're goal is in life, embrace it visualize it, and for it will be yours.",
         "Your shoes will make you happy today.",
         "You cannot love life until you live the life you love.",
         "Be on the lookout for coming events; They cast their shadows beforehand.",
@@ -75,7 +106,7 @@ fn HomePage() -> impl IntoView {
         "Meeting adversity well is the source of your strength.",
         "A dream you have will come true.",
         "Our deeds determine us, as much as we determine our deeds.",
-        "Never give up. You’re not a failure if you don’t give up.",
+        "Never give up. You're not a failure if you don't give up.",
         "You will become great if you believe in yourself.",
         "There is no greater pleasure than seeing your loved ones prosper.",
         "You will marry your lover.",
@@ -96,6 +127,14 @@ fn HomePage() -> impl IntoView {
         let random_index = (next as usize) % cookies.len();
         cookies[random_index]
     };
+
+    let status_resource = LocalResource::new(move || get_node_status());
+
+    let refresh_action = Action::new(move |&()| {
+        async move {
+            status_resource.refetch();
+        }
+    });
     
     view! {
         <h2>Fortune cookie selector: </h2>
@@ -103,5 +142,44 @@ fn HomePage() -> impl IntoView {
         <p>
             {cookie_val}
         </p> 
+        <h2>Node Status</h2>
+        <button on:click=move |_| { refresh_action.dispatch(()); }>
+            "Refresh Status"
+        </button>
+
+        // Use <Suspense> to show a fallback while data is loading
+        <Suspense
+            fallback=move || view! { <p>"Loading status..."</p> }
+        >
+            {move || {
+                // status_resource.get() returns an Option<Result<T, E>>
+                status_resource.get().map(|result| {
+                    match result {
+                        // Success!
+                        Ok(status) => view! {
+                            <div>
+                                <p><b>This Node:</b> {format!("{}:{}", status.this_node_ip, status.this_node_id)}</p>
+                                <p><b>Current Leader:</b> {format!("{}:{}", status.current_leader.0, status.current_leader.1)}</p>
+                                <h3>All Nodes:</h3>
+                                <ul>
+                                    {
+                                        status.all_nodes.iter().map(|(ip, id)| {
+                                            view! { <li>{format!("{}:{}", ip, id)}</li> }
+                                        }).collect_view()
+                                    }
+                                </ul>
+                            </div>
+                        }.into_any(),
+
+                        // Error
+                        Err(e) => view! {
+                            <div>
+                                <p style="color: red;">"Error loading status: " {e.to_string()}</p>
+                            </div>
+                        }.into_any(),
+                    }
+                })
+            }}
+        </Suspense>
     }
 }
