@@ -1,8 +1,8 @@
 # Get started with a build env with Rust nightly
-FROM rustlang/rust:nightly-bookworm as builder
+# FROM rustlang/rust:nightly-bookworm as builder
 
 # If you’re using stable, use this instead
-# FROM rust:1.88-bookworm as builder
+FROM rust:1.88-bookworm as builder
 
 # Install cargo-binstall, which makes it easier to install other
 # cargo extensions like cargo-leptos

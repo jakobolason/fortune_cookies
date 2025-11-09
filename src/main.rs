@@ -1,6 +1,6 @@
 use axum::{body::Body, extract::{FromRef, State}, http::Request, middleware::{self, Next}, response::{IntoResponse, Redirect, Response}, routing::{get, post}, Json, Router
 };
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Client, header};
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet}, 
@@ -11,32 +11,141 @@ use std::{
 };
 use leptos::{config::LeptosOptions, html::{address, U}};
 use tokio::{sync::{RwLock, RwLockWriteGuard}, time::{sleep, Duration, interval}, net::lookup_host};
+use tracing::instrument;
+use rand::prelude::*;
 
 use fortune_cookies::state::{AppState, generate_node_id};
 
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::{runtime, trace as sdktrace, Resource};
+use opentelemetry_sdk::trace::Tracer;
+use opentelemetry::KeyValue;
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
-async fn middleware_check_is_leader(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+/// Initializes the tracing subscriber (no OTLP exporter) to avoid relying on
+/// a specific opentelemetry_otlp API that may not be available.
+fn init_tracing(service_name: &str) {
+    // Simple console logging subscriber using environment-configured filter (RUST_LOG)
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(EnvFilter::from_default_env())
+        .finish();
 
-    println!("request to: {}", request.uri());
-    let leader = get_leader(&state).await;
-    println!("is leader? {}, {}, {}", leader.1, state.node_id, leader.1 == state.node_id);
-    if !(leader.1 == state.node_id) {
-        eprintln!("user tried to get to this node, who was not leader!");
-        let redirect_url = format!("http://{}{}", leader.0, request.uri());
-        Redirect::temporary(&redirect_url).into_response()
-    } else {
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("setting default subscriber failed");
+
+    tracing::info!("Tracing initialized for service: {}", service_name);
+}
+
+// async fn middleware_check_is_leader(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+
+//     tracing::info!("request to: {}", request.uri());
+//     let leader = get_leader(&state).await;
+//     tracing::info!("is leader? {}, {}, {}", leader.1, state.node_id, leader.1 == state.node_id);
+//     if !(leader.1 == state.node_id) {
+//         tracing::error!("user tried to get to this node, who was not leader!");
+//         let redirect_url = format!("http://{}{}", leader.0, request.uri());
+//         Redirect::temporary(&redirect_url).into_response()
+//     } else {
+//         let response = next.run(request).await;
+//         tracing::info!("response status: {}", response.status());
+//         response
+//     }
+// }
+
+async fn middleware_simple_proxy(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let leader_info = get_leader(&state).await;
+    let leader_id = leader_info.1;
+
+    // 1. Leader Check: If we are the leader, proceed to the handler
+    if leader_id == state.node_id {
         let response = next.run(request).await;
-        println!("response status: {}", response.status());
-        response
+        tracing::info!("Leader (Node {}) handling request. Status: {}", state.node_id, response.status());
+        return response;
+    }
+
+    // --- Non-Leader Logic: Simple GET Proxy ---
+    let leader_ip = leader_info.0.to_string();
+    let uri = request.uri();
+    
+    // Construct internal URL for the leader
+    let internal_url = format!("http://{}:3000{}", leader_ip, uri);
+
+    tracing::info!("Non-leader (Node {}) proxying simple GET to leader (Node {} at {})", state.node_id, leader_id, internal_url);
+    let http_client = Client::new();
+
+    //Execute the internal GET request using reqwest
+    match http_client.get(&internal_url).send().await {
+        Ok(res) => {
+            // 3. Convert the reqwest::Response to axum::Response
+            tracing::debug!("Internal proxy successful. Status: {}", res.status());
+            
+            let status = res.status();
+            let headers = res.headers().clone();
+            
+            // Get the body bytes (this handles the string response)
+            let body_bytes = res.bytes().await.unwrap_or_default();
+            
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "text/plain") // Assuming the cookie is text/plain
+                .body(Body::from(body_bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(e) => {
+            // 4. Handle failure (Leader is unreachable)
+            tracing::error!("Failed to proxy GET request to leader {}: {:?}", leader_ip, e);
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
     }
 }
-
-async fn middleware_for_api(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    println!("request to: {}", request.uri());
-    let response = next.run(request).await;
-    println!("response status: {}", response.status());
-    response
+const COOKIES: [&'static str; 32] = [
+        "Today its up to you to create the peacefulness you long for.",
+        "A friend asks only for your time not your money.",
+        "If you refuse to accept anything but the best, you very often get it.",
+        "A smile is your passport into the hearts of others.",
+        "A good way to keep healthy is to eat more Chinese food.",
+        "Your high-minded principles spell success.",
+        "Hard work pays off in the future, laziness pays off now.",
+        "Change can hurt, but it leads a path to something better.",
+        "Enjoy the good luck a companion brings you.",
+        "People are naturally attracted to you.",
+        "Hidden in a valley beside an open stream- This will be the type of place where you will find your dream.",
+        "A chance meeting opens new doors to success and friendship.",
+        "You learn from your mistakes... You will learn a lot today.",
+        "If you have something good in your life, don't let it go!",
+        "What ever you're goal is in life, embrace it visualize it, and for it will be yours.",
+        "Your shoes will make you happy today.",
+        "You cannot love life until you live the life you love.",
+        "Be on the lookout for coming events; They cast their shadows beforehand.",
+        "Land is always on the mind of a flying bird.",
+        "The man or woman you desire feels the same about you.",
+        "Meeting adversity well is the source of your strength.",
+        "A dream you have will come true.",
+        "Our deeds determine us, as much as we determine our deeds.",
+        "Never give up. You're not a failure if you don't give up.",
+        "You will become great if you believe in yourself.",
+        "There is no greater pleasure than seeing your loved ones prosper.",
+        "You will marry your lover.",
+        "A very attractive person has a message for you.",
+        "You already know the answer to the questions lingering inside your head.",
+        "It is now, and in this world, that we must live.",
+        "You must try, or hate yourself for not trying.",
+        "You can make your own happiness."
+    ];
+async fn get_cookie() -> &'static str{
+    
+    let mut rng = rand::rng();
+    
+    let random_index = rng.random_range(0..COOKIES.len());
+    
+    COOKIES[random_index]
 }
+
 
 async fn get_ids_from_peers(peers: impl Iterator<Item = SocketAddr>, port: u16) -> Vec<(Ipv4Addr, u32)> {
     let mut ip_vec: Vec<(Ipv4Addr, u32)> = Vec::new();
@@ -47,13 +156,13 @@ async fn get_ids_from_peers(peers: impl Iterator<Item = SocketAddr>, port: u16) 
                 Ok(resp) => {
                     match resp.json::<u32>().await {
                         Ok(node_id) => {
-                            println!("Got node_id {} from {:?}", node_id, ipv4);
+                            tracing::info!("Got node_id {} from {:?}", node_id, ipv4);
                             ip_vec.push((ipv4, node_id));
                         }
-                        Err(e) => eprintln!("Error parsing response from {}: {}", ipv4, e),
+                        Err(e) => tracing::error!("Error parsing response from {}: {}", ipv4, e),
                     }
                 }
-                Err(e) => eprintln!("Error with request to {}: {}", ipv4, e),
+                Err(e) => tracing::error!("Error with request to {}: {}", ipv4, e),
             } 
         }    
     }
@@ -61,12 +170,12 @@ async fn get_ids_from_peers(peers: impl Iterator<Item = SocketAddr>, port: u16) 
 }
 
 async fn dns_lookup(service_name: &str, port: u16) -> Result<Vec<SocketAddr>, std::io::Error> {
-    println!("Making a DNS lookup to service with {} and port: {}", service_name, port);
+    tracing::info!("Making a DNS lookup to service with {} and port: {}", service_name, port);
     
     let address = format!("{}:{}", service_name, port);
     let addresses  = lookup_host(&address).await?;
     
-    println!("Got response from DNS");
+    tracing::info!("Got response from DNS");
     Ok(addresses.collect())
 }
 async fn discovery(service_name: &str, port: u16) -> Result<Vec<(Ipv4Addr, u32)>, std::io::Error> {
@@ -83,10 +192,10 @@ async fn background_task(state: AppState) {
     interval.tick().await;
 
     // this should get all ips
-    println!("background task for node {} running at: {:?}",state.node_id, std::time::SystemTime::now());
+    tracing::info!("background task for node {} running at: {:?}",state.node_id, std::time::SystemTime::now());
     match discovery("bully-service", state.port).await {
         Ok(ips) => {
-            println!("Found ips: {:?}", ips);
+            tracing::info!("Found ips: {:?}", ips);
             let found_leader = {
                 let mut ip_list_guard: RwLockWriteGuard<'_, Vec<(Ipv4Addr, u32)>> = state.ip_list.write().await;
                 *ip_list_guard = ips.clone();
@@ -94,21 +203,21 @@ async fn background_task(state: AppState) {
                 ips.iter().any(|entry| entry.1 > state.node_id )
             };
             if !found_leader {
-                println!("found no node higher than me, so starting election!");
+                tracing::info!("found no node higher than me, so starting election!");
                 // call election on yourself
                 tokio::spawn(leader_election(state.clone()));
             }
         }
         Err(e) => {
-            eprintln!("DNS lookup failed: {}", e);
+            tracing::error!("DNS lookup failed: {}", e);
         }
     }
     loop {
         interval.tick().await;
-        println!("background task for node {} running at: {:?}",state.node_id, std::time::SystemTime::now());
+        tracing::info!("background task for node {} running at: {:?}",state.node_id, std::time::SystemTime::now());
         match discovery("bully-service", state.port).await {
             Ok(ips) => {
-                println!("Found ips: {:?}", ips);
+                tracing::info!("Found ips: {:?}", ips);
                 let previous_leader = {
                     let (_, leader_id) = get_leader(&state).await;
                     // write ips to list
@@ -128,16 +237,16 @@ async fn background_task(state: AppState) {
                 // these could be collected, but just to have more clear logs
                 if previous_leader != found_leader {
                     // if the leader is dead, then a lower node is the one we found
-                    println!("The current leader is missing, or a higher node exists now!");
+                    tracing::info!("The current leader is missing, or a higher node exists now!");
                     tokio::spawn(leader_election(state.clone()));
                 } 
                 else if found_leader < state.node_id {
-                    println!("the found leader is smaller than me, calling election!");
+                    tracing::info!("the found leader is smaller than me, calling election!");
                     tokio::spawn(leader_election(state.clone()));
                 }
             }
             Err(e) => {
-                eprintln!("DNS lookup failed: {}", e);
+                tracing::error!("DNS lookup failed: {}", e);
             }
         }
     }
@@ -176,12 +285,6 @@ struct MessageType {
     node_id: u32,
 }
 
-async fn send_unicast(port: u16, msg: MessageType, endpoint: MessageEndpoints) 
-    -> Result<reqwest::Response, reqwest::Error> {
-    let url = format!("http://{}:{}/{}", msg.ip, port, endpoint.as_str());
-    return reqwest::get(&url).await
-}
-
 async fn send_coordinator(state: &AppState, ip_list: Vec<(Ipv4Addr, u32)>) 
     -> Vec<Result<reqwest::Response, reqwest::Error>> {
      
@@ -210,16 +313,17 @@ async fn send_election(endpoints: Vec<Ipv4Addr>, port: u16)
 }
 
 // election algorithmn
+#[instrument(skip(state), fields(node_id = state.node_id))]
 async fn leader_election(state: AppState) {
     {
         let mut election_guard = state.in_election.write().await;
         if *election_guard {
-            println!("Node {} is already in an election, ignoring new call.", state.node_id);
+            tracing::info!("Node {} is already in an election, ignoring new call.", state.node_id);
             return; // Already in an election, do nothing
         }
         *election_guard = true;
     }
-    println!("Starting election for node {}", state.node_id);
+    tracing::info!("Starting election for node {}", state.node_id);
     let ip_list_guard: Vec<(Ipv4Addr, u32)> = state.ip_list.read().await.to_vec();
     let ip_list = ip_list_guard.clone();
     let election_candidates: Vec<Ipv4Addr> = ip_list
@@ -227,7 +331,7 @@ async fn leader_election(state: AppState) {
         .filter(|(_, id)| *id > state.node_id)
         .map(|(ip, _)| ip.clone())
         .collect();
-    println!("Node {} will send elections to {} candidates", state.node_id, election_candidates.len());
+    tracing::info!("Node {} will send elections to {} candidates", state.node_id, election_candidates.len());
 
     let is_leader = if election_candidates.len() != 0 {
         // else ask every candidate, and wait for 1 ok
@@ -246,13 +350,13 @@ async fn leader_election(state: AppState) {
         true
     };
     if is_leader {
-        println!("This node: {} is leader", state.node_id);
+        tracing::info!("This node: {} is leader", state.node_id);
         // if no candidates or no candidates responded, we are leader 
         write_new_leader(&state, (state.node_ip.clone(), state.node_id.clone())).await;
         // send broadcast, saying it is now leader
         send_coordinator(&state, ip_list).await;
         let (leader_ip, leader_id) = get_leader(&state).await;
-        println!("leader is index : {} with ip: {}", leader_id, leader_ip);
+        tracing::info!("leader is index : {} with ip: {}", leader_id, leader_ip);
     }
     // finally release the lock
     {
@@ -272,7 +376,7 @@ async fn recieve_coordinator(
     Json(payload): Json<CoordinatorInfo>
     ) -> impl IntoResponse {
     // get the ip and node_id from request
-    println!("Got node_id = {} from IP = {}", payload.node_id, payload.ip);
+    tracing::info!("Got node_id = {} from IP = {}", payload.node_id, payload.ip);
     write_new_leader(&state, (payload.ip, payload.node_id)).await;
     (StatusCode::OK, "Recieved")
 }
@@ -297,7 +401,19 @@ async fn main() {
     use leptos::prelude::*;
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use fortune_cookies::app::*;
+    use tower_http::{cors::{CorsLayer, Any}, trace::TraceLayer};
+    use axum::http::Method;
+    use tracing::subscriber;
+    use tracing_subscriber::{EnvFilter, FmtSubscriber, fmt::format::FmtSpan};
 
+    init_tracing("bully-app");
+    tracing::info!("Tracing initialized. Starting up node...");
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any) // For development - be more restrictive in production!
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(Any);
+    
     let port = env::var("WEB_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
@@ -317,12 +433,20 @@ async fn main() {
     };
     let state = AppState::new(leptos_options, ip_addr, port, generate_node_id());
 
+    let cookie_router = Router::new()
+        .route("/get_cookie", get(get_cookie))
+        .layer(middleware::from_fn_with_state(state.clone(), middleware_simple_proxy));
+
     let api_router = Router::new()
         .route("/status",get(get_status))
         .route("/node_id", get(get_node_id))
         .route("/recieve_election", get(recieve_election))
         .route("/recieve_coordinator", post(recieve_coordinator))
-        .with_state(state.clone());
+        .nest("/api", cookie_router)
+        .with_state(state.clone())
+        .layer(TraceLayer::new_for_http());
+
+    
 
     let leptos_router = Router::new()
         .leptos_routes(&state, routes, {
@@ -334,18 +458,20 @@ async fn main() {
                 provide_context(app_state_for_context.clone());
                 shell(leptos_options.clone())}
         })
-        .layer(middleware::from_fn_with_state(state.clone(), middleware_check_is_leader))
+        // .layer(middleware::from_fn_with_state(state.clone(), middleware_check_is_leader))
         .fallback(leptos_axum::file_and_error_handler::<AppState, _>(shell))
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(TraceLayer::new_for_http());
 
     let app = Router::new()
         .merge(api_router)
-        .merge(leptos_router);
+        .merge(leptos_router)
+        .layer(cors);
 
     let background_handle = tokio::spawn(background_task(state.clone()));
     // run our app with hyper
     // `axum::Server` is a re-export of `hyper::Server`
-    log!("listening on http://{}", &addr);
+    tracing::info!("listening on http://{}", &addr);
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app.into_make_service())
         .await
@@ -480,6 +606,6 @@ mod tests {
     //     expected_ids.sort();
     //
     //     assert_eq!(found_ids, expected_ids);
-    //     println!("Successfully discovered peers: {:?}", found_ids);
+    //     tracing::info!("Successfully discovered peers: {:?}", found_ids);
     // }
 }

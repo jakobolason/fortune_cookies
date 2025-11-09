@@ -6,7 +6,7 @@ spec:
   selector:
     matchLabels:
       app: bully-app
-  replicas: 6
+  replicas: 4
   template:
     metadata:
       name: bully-app
@@ -16,7 +16,7 @@ spec:
     spec:
       containers:
         - name: bully-container
-          image: fortune_cookies:v0.0.3
+          image: fortune_cookies:v0.0.6
           imagePullPolicy: Never
           env:
             - name: WEB_PORT
@@ -25,6 +25,16 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: status.podIP
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://jaeger-collector.default.svc.cluster.local:4317"
+            
+            # 2. This sets the service name (must match init_tracing)
+            - name: OTEL_SERVICE_NAME
+              value: "bully-app"
+
+            # 3. This sets your log level for the console
+            - name: RUST_LOG
+              value: "info,fortune_cookies=debug" # Or whatever you called your crate
           ports:
             - containerPort: 3000
               name: http
