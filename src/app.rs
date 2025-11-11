@@ -23,8 +23,13 @@ pub async fn get_node_status() -> Result<NodeStatus, ServerFnError> {
     let state: AppState = use_context::<AppState>()
         .ok_or_else(|| ServerFnError::new("app state not found"))?;
 
+    tracing::info!("found state: {:?}", state);
+
+    leptos::logging::log!("found state: {:?}", state);
     let leader_guard = state.leader.read().await;
     let ip_list_guard = state.ip_list.read().await;
+    leptos::logging::log!("found leader: {:?}", leader_guard);
+    leptos::logging::log!("ip list: {:?}", ip_list_guard);
 
     let status = NodeStatus {
         this_node_id: state.node_id,
@@ -81,8 +86,8 @@ pub fn App() -> impl IntoView {
 
 async fn fetch_cookie(node_state: NodeStatus) -> Result<String, String> {
     println!("Trying to get cookie");
-    tracing::info!("in here");
-    let leader_url = node_state.current_leader.0.to_string().replace("0.0.0.0", "localhost");
+
+    let leader_url = node_state.current_leader.0.to_string().replacen("0.0.0.0", "localhost", 1);
     let url = format!("http://{}:3000/api/get_cookie", leader_url);
     leptos::logging::log!("trying to reach url: {}", url);
     let response = reqwest::get(url)

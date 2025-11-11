@@ -20,7 +20,7 @@ pub fn generate_node_id() -> u32 {
 }
 
 #[cfg(feature = "ssr")]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AppState {
     pub leptos_options: LeptosOptions,
     pub leader: Arc<RwLock<(Ipv4Addr, u32)>>,

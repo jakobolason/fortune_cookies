@@ -1,26 +1,16 @@
-use axum::{body::Body, extract::{FromRef, State}, http::Request, middleware::{self, Next}, response::{IntoResponse, Redirect, Response}, routing::{get, post}, Json, Router
+use axum::{body::Body, extract::{State}, http::Request, middleware::{self, Next}, response::{IntoResponse, Response}, routing::{get, post}, Json, Router
 };
 use reqwest::{StatusCode, Client, header};
-use core::fmt;
 use std::{
-    collections::{HashMap, HashSet}, 
     env, 
     net::{IpAddr, Ipv4Addr, SocketAddr}, 
-    sync::{Arc}, 
-    time::{SystemTime, UNIX_EPOCH}
 };
-use leptos::{config::LeptosOptions, html::{address, U}};
-use tokio::{sync::{RwLock, RwLockWriteGuard}, time::{sleep, Duration, interval}, net::lookup_host};
+use tokio::{sync::{RwLockWriteGuard}, time::{Duration, interval}, net::lookup_host};
 use tracing::instrument;
 use rand::prelude::*;
+use leptos::logging::log;
 
 use fortune_cookies::state::{AppState, generate_node_id};
-
-use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::{runtime, trace as sdktrace, Resource};
-use opentelemetry_sdk::trace::Tracer;
-use opentelemetry::KeyValue;
-use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, FmtSubscriber};
 
 /// Initializes the tracing subscriber (no OTLP exporter) to avoid relying on
@@ -138,7 +128,7 @@ const COOKIES: [&'static str; 32] = [
         "You can make your own happiness."
     ];
 async fn get_cookie() -> &'static str{
-    
+    log!("sending cookie"); 
     let mut rng = rand::rng();
     
     let random_index = rng.random_range(0..COOKIES.len());
@@ -376,7 +366,7 @@ async fn recieve_coordinator(
     Json(payload): Json<CoordinatorInfo>
     ) -> impl IntoResponse {
     // get the ip and node_id from request
-    tracing::info!("Got node_id = {} from IP = {}", payload.node_id, payload.ip);
+    tracing::info!("COORDINATOR: Got node_id = {} from IP = {}", payload.node_id, payload.ip);
     write_new_leader(&state, (payload.ip, payload.node_id)).await;
     (StatusCode::OK, "Recieved")
 }
@@ -397,14 +387,11 @@ async fn get_node_id(State(state): State<AppState>) -> Json<u32> {
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {
-    use leptos::logging::log;
     use leptos::prelude::*;
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use fortune_cookies::app::*;
     use tower_http::{cors::{CorsLayer, Any}, trace::TraceLayer};
     use axum::http::Method;
-    use tracing::subscriber;
-    use tracing_subscriber::{EnvFilter, FmtSubscriber, fmt::format::FmtSpan};
 
     init_tracing("bully-app");
     tracing::info!("Tracing initialized. Starting up node...");
@@ -434,8 +421,8 @@ async fn main() {
     let state = AppState::new(leptos_options, ip_addr, port, generate_node_id());
 
     let cookie_router = Router::new()
-        .route("/get_cookie", get(get_cookie))
-        .layer(middleware::from_fn_with_state(state.clone(), middleware_simple_proxy));
+        .route("/get_cookie", get(get_cookie));
+        // .layer(middleware::from_fn_with_state(state.clone(), middleware_simple_proxy));
 
     let api_router = Router::new()
         .route("/status",get(get_status))
